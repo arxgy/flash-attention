@@ -1179,7 +1179,7 @@ def attention_combine_ref(out_partial, lse_partial):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float32])
 # @pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
-@pytest.mark.parametrize("d", [64, 96, 128, 192, 256, 512])
+@pytest.mark.parametrize("d", [59, 64, 96, 128, 192, 256, 512])
 # @pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize("seqlen", [1, 2, 3, 32, 64, 256, 113, 108, 640, 1024])
 # @pytest.mark.parametrize("seqlen", [12, 32, 64, 256, 112, 108, 640, 1024, 2048, 8192])
@@ -1187,7 +1187,8 @@ def attention_combine_ref(out_partial, lse_partial):
 @pytest.mark.parametrize("num_splits", [1, 2, 3, 5, 17, 32, 55, 97, 133])
 # @pytest.mark.parametrize("num_splits", [1, 2, 3, 5, 11])
 # @pytest.mark.parametrize("num_splits", [128])
-def test_flash_attn_combine(num_splits, seqlen, d, dtype):
+@pytest.mark.parametrize("pad", [0, 2])  # 2: out_partial and out are views into rows 2 elements wider
+def test_flash_attn_combine(pad, num_splits, seqlen, d, dtype):
     if DISABLE_SPLIT:
         pytest.skip()
     device = "cuda"
@@ -1197,11 +1198,16 @@ def test_flash_attn_combine(num_splits, seqlen, d, dtype):
     nheads = 16
     # batch_size = 1
     # nheads = 1
-    out_partial = torch.randn(num_splits * 2, batch_size, nheads, seqlen, d, device=device, dtype=torch.float32).transpose(2, 3)[:num_splits]  # To test non-contiguous tensor
+    if pad and 4 * num_splits * batch_size * nheads * seqlen * d * 4 > torch.cuda.get_device_properties("cuda").total_memory:
+        pytest.skip()  # out_partial, the copy of its unaligned rows and the reference OOM
+    out_partial = torch.randn(num_splits * 2, batch_size, nheads, seqlen, d + pad, device=device, dtype=torch.float32)[..., :d].transpose(2, 3)[:num_splits]  # To test non-contiguous tensor
     lse_partial = torch.randn(num_splits, batch_size, nheads * 2, seqlen, device=device, dtype=torch.float32).transpose(-1, -2)[:, :, :, :nheads]  # To test non-contiguous tensor
     # To test short-circuiting based on num_splits
     lse_partial[num_splits // 2:, :batch_size // 3] = -float("inf")
-    out, lse = flash_attn_combine(out_partial, lse_partial, out_dtype=dtype)
+    out_given = None if pad == 0 else torch.empty(batch_size, seqlen, nheads, d + pad, device=device, dtype=dtype)[..., :d]
+    out, lse = flash_attn_combine(out_partial, lse_partial, out=out_given, out_dtype=dtype)
+    if out_given is not None:
+        assert torch.equal(out, out_given)
     out_ref, lse_ref = attention_combine_ref(out_partial, lse_partial)
     out_pt = out_ref.to(dtype)
 

@@ -1605,6 +1605,20 @@ mha_combine(at::Tensor out_partial,         // num_splits x batch_size x seqlen 
         return x.size(-1) % alignment == 0 ? x : torch::nn::functional::pad(x, torch::nn::functional::PadFuncOptions({0, alignment - x.size(-1) % alignment}));
     };
     out_partial_padded = pad(out_partial, alignment);
+    // The kernel reads out_partial and writes out 4 elements at a time (kGmemElemsPerLoad: a 16-byte
+    // cp.async of floats, a 4-element vector store of the output type), so every row must start at a
+    // multiple of 4 elements: the base aligned to 4 elements and every stride a multiple of 4.
+    // pad() returns the caller's tensor unchanged when head_size_og % alignment == 0.
+    auto rows_aligned = [alignment](at::Tensor const& x) {
+        if (reinterpret_cast<uintptr_t>(x.data_ptr()) % (alignment * x.element_size()) != 0) { return false; }
+        for (int64_t i = 0; i < x.dim() - 1; ++i) {
+            if (x.size(i) > 1 && x.stride(i) % alignment != 0) { return false; }
+        }
+        return true;
+    };
+    if (!rows_aligned(out_partial_padded)) {
+        out_partial_padded = out_partial_padded.clone(at::MemoryFormat::Contiguous);
+    }
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     const int head_size = round_multiple(head_size_og, alignment);
@@ -1619,7 +1633,7 @@ mha_combine(at::Tensor out_partial,         // num_splits x batch_size x seqlen 
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         CHECK_SHAPE(out, batch_size, seqlen, num_heads, head_size_og);
-        if (head_size_og % alignment != 0) {
+        if (head_size_og % alignment != 0 || !rows_aligned(out)) {
             out = torch::empty({batch_size, seqlen, num_heads, head_size}, opts.dtype(out_type));
         }
     } else {
@@ -1664,8 +1678,9 @@ mha_combine(at::Tensor out_partial,         // num_splits x batch_size x seqlen 
     at::Tensor out_padded = out;
     if (head_size_og % alignment != 0) {
         out = out.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
-        // if (out_.has_value()) { out_.value().copy_(out); }
     }
+    // the result into the caller's out where the kernel wrote a buffer of its own
+    if (out_.has_value() && out.data_ptr() != out_.value().data_ptr()) { out_.value().copy_(out); out = out_.value(); }
 
     return {out, softmax_lse};
 }
