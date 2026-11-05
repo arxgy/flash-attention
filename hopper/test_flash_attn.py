@@ -709,6 +709,7 @@ def test_flash_attn_varlen_output(
         (128, 128),
         (256, 512),  # To test appending KV with more than 1 block
         (2048, 3577),  # Enough tile to test persistent scheduler
+        (128, 0),  # No key: a key cache of no row, or a page table of no column
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
@@ -737,6 +738,8 @@ def test_flash_attn_kvcache(
     if not new_kv and rotary_fraction > 0.0:
         pytest.skip()
     if rotary_fraction == 0.0 and has_rotary_seqlens:
+        pytest.skip()
+    if seqlen_k == 0 and (causal or local):  # the window and the attention chunk are drawn from [0, seqlen_k)
         pytest.skip()
     device = "cuda"
     # set seed
@@ -808,7 +811,7 @@ def test_flash_attn_kvcache(
                 seqlen_k, page_size, batch_size_cache, nheads_k, d, dv, device, dtype, dtype_ref
             )
         cache_seqlens = torch.randint(
-            0 if new_kv else 1,
+            0 if new_kv or seqlen_k == 0 else 1,
             # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
             (
                 (seqlen_k - (seqlen_q if (causal or local) and rotary_dim > 1 else seqlen_new) + 1)
@@ -973,7 +976,7 @@ def test_flash_attn_kvcache(
                     qv=qv if not varlen_q else qv_unpad,
                     rotary_cos=cos,
                     rotary_sin=sin,
-                    cache_seqlens=cache_seqlens,
+                    cache_seqlens=cache_seqlens if seqlen_k > 0 else None,
                     cache_batch_idx=cache_batch_idx,
                     cache_leftpad=cache_leftpad,
                     page_table=page_table,
@@ -1049,6 +1052,8 @@ def test_flash_attn_kvcache(
                 assert (out - out_ref).abs().max().item() <= mult * (out_pt - out_ref).abs().max().item() + 1e-5
                 mult_mean = 3 if dtype == torch.float8_e4m3fn else 1.5
                 assert (out - out_ref).abs().mean().item() <= mult_mean * (out_pt - out_ref).abs().mean().item()
+                if seqlen_k == 0:
+                    assert torch.isinf(lse).all()  # no key: +inf from the host, -inf from the kernel
 
 
 def _generate_block_kvcache(seqlen_k, page_size, batch_size, nheads_k, d, dv, device, dtype, dtype_ref):

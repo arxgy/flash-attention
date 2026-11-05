@@ -1164,7 +1164,10 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     TORCH_CHECK(!k_new_.has_value(), "This flash attention build does not support appending KV.");
     #endif
 
-    if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0) {
+    // A paged cache's `total_k` counts its pages' rows (batch_size * page_size), not the keys: a page
+    // table of no column has none
+    int const total_k_attended = !paged_KV ? total_k : batch_size * seqlen_k;
+    if (total_q > 0 && (total_k_attended + params.total_knew) > 0 && num_heads_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
         run_mha_fwd(params, stream);
         if (params.num_splits > 1) {
